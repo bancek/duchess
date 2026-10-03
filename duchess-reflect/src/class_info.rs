@@ -11,6 +11,21 @@ use crate::{
     upcasts::Upcasts,
 };
 
+/// Rust keywords (strict and reserved, through edition 2024) that cannot be
+/// used as a generated module, struct or method name. See [`Id::to_ident`].
+///
+/// The list is hardcoded because neither `syn` nor `proc-macro2` exposes this.
+/// Its entries mirror syn's private ident validation, which doesn't yet include
+/// `gen`, so that one is added by hand. Contextual keywords like `union` are
+/// valid identifiers and are deliberately not listed.
+const RUST_KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+    "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
+    "return", "Self", "self", "static", "struct", "super", "trait", "true", "try", "type",
+    "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+];
+
 /// Stores all the data about the classes/packages to be translated
 /// as well as whatever we have learned from reflection.
 #[derive(Debug)]
@@ -704,9 +719,27 @@ impl Id {
         DotId::from(self).dot(s)
     }
 
+    /// Returns this segment as a valid Rust identifier, escaping characters
+    /// that Rust forbids and names that it reserves as keywords.
+    ///
+    /// A `$` becomes `__`, since `$` is not valid in a Rust identifier (e.g.
+    /// the nested class `Map$Entry` becomes `Map__Entry`).
+    ///
+    /// Rust keywords get a trailing `_` (e.g. `impl` becomes `impl_`). A raw
+    /// identifier like `r#impl` would keep the name as-is, but `crate`, `self`,
+    /// `Self` and `super` cannot be raw identifiers, so every keyword takes the
+    /// suffix for consistency.
+    ///
+    /// The rewrites never interact. Replacing `$` always inserts `__`, which no
+    /// keyword contains, so a name with `$` cannot also be a keyword.
     pub fn to_ident(&self, span: Span) -> Ident {
-        let data = self.data.replace("$", "__");
-        Ident::new(&data, span)
+        if self.data.contains('$') {
+            Ident::new(&self.data.replace('$', "__"), span)
+        } else if RUST_KEYWORDS.contains(&self.data.as_str()) {
+            Ident::new(&format!("{}_", self.data), span)
+        } else {
+            Ident::new(&self.data, span)
+        }
     }
 
     pub fn to_snake_case(&self) -> Self {
@@ -1085,5 +1118,54 @@ mod test {
             resolver.rust_name(&external, span).to_string(),
             "duchess :: java :: lang :: String",
         );
+    }
+
+    #[test]
+    fn to_ident_escapes_rust_keywords() {
+        let span = Span::call_site();
+        for keyword in RUST_KEYWORDS {
+            assert_eq!(
+                Id::from(*keyword).to_ident(span).to_string(),
+                format!("{keyword}_"),
+            );
+        }
+        // Non-keywords are not changed, including the contextual keyword
+        // `union` and already-escaped names.
+        for name in ["metrics", "NullMetricsProvider", "impl_", "union"] {
+            assert_eq!(Id::from(name).to_ident(span).to_string(), name);
+        }
+    }
+
+    #[test]
+    fn to_ident_replaces_dollar_signs() {
+        let span = Span::call_site();
+        assert_eq!(
+            Id::from("Map$Entry").to_ident(span).to_string(),
+            "Map__Entry",
+        );
+    }
+
+    #[test]
+    fn module_name_escapes_keyword_segments() {
+        let span = Span::call_site();
+        let name = DotId::parse("org.apache.zookeeper.metrics.impl.NullMetricsProvider");
+        assert_eq!(
+            name.to_module_name(span).to_string(),
+            "org :: apache :: zookeeper :: metrics :: impl_ :: NullMetricsProvider",
+        );
+    }
+
+    #[test]
+    fn rust_keywords_match_syn_ident_parsing() {
+        for keyword in RUST_KEYWORDS {
+            let parsed = syn::parse_str::<syn::Ident>(keyword);
+            if *keyword == "gen" {
+                // Reserved in edition 2024; syn does not know it yet. If this
+                // assert fails, syn has caught up and the exception can go.
+                assert!(parsed.is_ok(), "syn now rejects `gen`");
+            } else {
+                assert!(parsed.is_err(), "`{keyword}` is not a Rust keyword per syn");
+            }
+        }
     }
 }
